@@ -8,7 +8,43 @@ A Client-Side Machine Learning Playground.
 
  [Client-Side Machine Learning ](https://europanite.github.io/client_side_ml/)
 
+Import **CSV/XLSX** in the browser, visualize **all series**, pick a **target**, train a tiny **decision-tree (CART) regressor**, then **predict the next 1 point** — all client-side with Expo + Metro (web), Recharts, and SheetJS.
+
 ---
+
+## ✨ Features
+
+- **One-click import** of `.csv`, `.xlsx` (first sheet is used)
+- **Auto schema detection**: finds datetime column and numeric columns
+- **Full multi-series chart** with **color-coded lines & toggles**
+- **Target chooser** (color chips) → **Train** (CART) → **Predict +1**
+- **Pure client-side**: no backend required
+
+---
+
+## 🖼️ Data & Charting
+
+- **CSV format**: header row + rows of values. If a column is named `datetime` / `date` / `time`, it will be used as X-axis labels. Numeric columns are auto-detected and plotted.
+- **XLSX**: the first sheet is parsed via **SheetJS** on web.
+
+---
+
+## 🧠 Model (CART regressor)
+
+- Pure TypeScript implementation (no native bindings)
+- Greedy binary splits on quantile candidates
+- Defaults: `maxDepth=4`, `minLeaf=8`
+- Train button builds the tree on filtered numeric rows; **Predict +1** uses the **last row’s feature vector** to estimate the next target value.
+
+
+---
+
+### Acknowledgements
+
+- **Expo + Metro** for the web app build
+- **Recharts** for fast SVG charts
+- **SheetJS** for in-browser Excel parsing
+
 
 ## 🧰 How It Works
 
@@ -42,5 +78,5 @@ docker compose \
 
 ---
 
-# License
+## 📜 License
 - Apache License 2.0
