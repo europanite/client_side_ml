@@ -8,6 +8,21 @@ import {
   ScrollView,
 } from "react-native";
 
+
+const LAGS = [1, 2, 3];                 // use 1~3 step lags
+const USE_DATETIME_FEATURES = true;     // add cyclic time features if datetime column exists
+
+function sincos(value: number, period: number) {
+  const angle = (2 * Math.PI * value) / period;
+  return { sin: Math.sin(angle), cos: Math.cos(angle) };
+}
+
+function getDateParts(d: Date) {
+  const w = d.getDay();   // 0..6
+  const m = d.getMonth(); // 0..11
+  return { weekday: w, month: m };
+}
+
 // --- Recharts (Web only) ---
 let Recharts: any = {};
 if (Platform.OS === "web") {
@@ -388,21 +403,95 @@ export default function HomeScreen() {
     setVisible((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
 
-  const Xy = useMemo(() => {
-    if (!df || !target) return { X: [] as number[][], y: [] as number[], feat: [] as string[] };
-    const feat = df.numericCols.filter((c) => c !== target);
+    // ----- Build multivariate time-series features: X(t) -> y(t+1) -----
+    const Xy = useMemo(() => {
+    if (!df || !target) {
+        return {
+        X: [] as number[][],
+        y: [] as number[],
+        featNames: [] as string[],
+        makeNextX: () => [] as number[],
+        maxLag: 0,
+        };
+    }
+
+    const datetimeKey = df.datetimeKey;
+    const allSeries = df.numericCols;
+    const exo = allSeries.filter((c) => c !== target); // exogenous series
+
+    const featNames: string[] = [];
+
+    // base: current-time exogenous features (t)
+    for (const s of exo) featNames.push(`${s}(t)`);
+
+    // lags for target and all exogenous
+    for (const l of LAGS) {
+        featNames.push(`${target}(t-${l})`);
+        for (const s of exo) featNames.push(`${s}(t-${l})`);
+    }
+
+    // datetime cyclic features
+    if (USE_DATETIME_FEATURES && datetimeKey) {
+        featNames.push("dow_sin", "dow_cos", "mon_sin", "mon_cos");
+    }
+
+    const maxLag = Math.max(0, ...LAGS);
     const X: number[][] = [];
     const y: number[] = [];
-    for (const r of df.rows) {
-      const rowX = feat.map((f) => (typeof r[f] === "number" ? (r[f] as number) : NaN));
-      if (rowX.some((v) => !Number.isFinite(v))) continue;
-      const yy = r[target];
-      if (typeof yy !== "number" || !Number.isFinite(yy)) continue;
-      X.push(rowX);
-      y.push(yy);
+
+    // helper to read a numeric cell (or NaN)
+    const getNum = (rowIdx: number, col: string): number =>
+        typeof df.rows[rowIdx]?.[col] === "number" ? (df.rows[rowIdx][col] as number) : NaN;
+
+    // compose feature vector for an index t (predicting y at t+1)
+    const makeXAt = (t: number): number[] => {
+        const row: number[] = [];
+
+        // current-time exogenous at t
+        for (const s of exo) row.push(getNum(t, s));
+
+        // lags for target & exogenous
+        for (const l of LAGS) {
+        row.push(getNum(t - l, target)); // target lag
+        for (const s of exo) row.push(getNum(t - l, s)); // exo lag
+        }
+
+        // datetime features at t
+        if (USE_DATETIME_FEATURES && datetimeKey) {
+        const dv = df.rows[t]?.[datetimeKey];
+        if (dv instanceof Date && !isNaN(+dv)) {
+            const { weekday, month } = getDateParts(dv);
+            const d = sincos(weekday, 7);
+            const m = sincos(month, 12);
+            row.push(d.sin, d.cos, m.sin, m.cos);
+        } else {
+            row.push(0, 0, 0, 0); // fallback
+        }
+        }
+
+        return row;
+    };
+
+    // Build dataset: use rows [maxLag .. N-2] as feature rows (predict y at t+1)
+    const N = df.rows.length;
+    for (let t = maxLag; t <= N - 2; t++) {
+        const x = makeXAt(t);
+        if (x.some((v) => !Number.isFinite(v))) continue; // drop rows with NaN
+        const yNext = getNum(t + 1, target);
+        if (!Number.isFinite(yNext)) continue;
+        X.push(x);
+        y.push(yNext);
     }
-    return { X, y, feat };
-  }, [df, target]);
+
+    // build "next" feature for prediction at N (use last available t = N-1)
+    const makeNextX = (): number[] => {
+        const t = N - 1;
+        return makeXAt(t);
+    };
+
+    return { X, y, featNames, makeNextX, maxLag };
+    }, [df, target]);
+
 
   const train = useCallback(() => {
     if (!df || !target) {
@@ -420,26 +509,20 @@ export default function HomeScreen() {
     setStatus(`Trained CART with ${m.nFeatures} features on ${X.length} rows.`);
   }, [df, target, Xy]);
 
-  const predict = useCallback(() => {
+    const predict = useCallback(() => {
     if (!df || !target || !model) {
-      setStatus("Train a model first.");
-      return;
+        setStatus("Train a model first.");
+        return;
     }
-    const feat = df.numericCols.filter((c) => c !== target);
-    if (!feat.length) {
-      setStatus("No features to predict from.");
-      return;
+    const xNext = Xy.makeNextX();
+    if (!xNext.length || xNext.some((v) => !Number.isFinite(v))) {
+        setStatus("Not enough history to build features for t+1. Add more rows.");
+        return;
     }
-    const last = df.rows[df.rows.length - 1];
-    const x = feat.map((f) => (typeof last[f] === "number" ? (last[f] as number) : NaN));
-    if (x.some((v) => !Number.isFinite(v))) {
-      setStatus("Last row has missing feature values.");
-      return;
-    }
-    const yhat = model.predictBatch([x])[0];
+    const yhat = model.predictBatch([xNext])[0];
     setPrediction(yhat);
-    setStatus("Predicted next 1 step (using last row features).");
-  }, [df, target, model]);
+    setStatus(`Predicted next 1 step: ${target}(t+1).`);
+    }, [df, target, model, Xy]);
 
   // ----- Chart Data -----
   const chartData = useMemo(() => {
@@ -495,7 +578,7 @@ export default function HomeScreen() {
           {/* Header */}
           <View style={{ gap: 8 }}>
             <Text style={{ color: "#fff", fontSize: 22, fontWeight: "700" }}>
-              Client-side ML — Time-series Playground
+              Client Side Machine Learning
             </Text>
             <Text style={{ color: "#9aa0a6" }}>
               Import CSV/XLSX, view all series, choose a target, train a tiny CART, and predict one
