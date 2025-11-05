@@ -4,9 +4,9 @@ import { Platform, Text, View, Pressable, useWindowDimensions } from "react-nati
 /**
  * HomeScreen
  * - Import time-series CSV from a file picker
- * - Plot all series with distinct colors (web: HTMLCanvasElement; native: simple fallback text)
+ * - Plot all series with distinct colors (web: HTMLCanvasElement; native
  * - Choose a target variable
- * - Train: try XGBoost (web, via dynamic <script> loader). If unavailable, fallback to a tiny CART regressor.
+ * - Train: try a tiny CART regressor.
  * - Predict: one-step-ahead prediction using last-available features (current row) to predict next target.
  *
  * No extra dependencies; works in Expo web export.
@@ -21,7 +21,7 @@ type DataFrame = {
 };
 
 type Model = {
-  type: "xgboost" | "cart";
+  type: "cart";
   fit: (X: number[][], y: number[]) => Promise<void> | void;
   predict: (X: number[][]) => number[]; // batch predict
 };
@@ -101,7 +101,7 @@ function buildSupervised(df: DataFrame, target: string) {
   return { X, y, orderedRows: rows };
 }
 
-// ---------- Tiny CART Regressor (fallback if XGBoost is unavailable) ----------
+// ---------- Tiny CART Regressor ----------
 class CARTRegressor {
   private root: any = null;
   constructor(private maxDepth = 3, private minLeaf = 5) {}
@@ -173,40 +173,6 @@ function bestSplit(X: number[][], y: number[]) {
     }
   }
   return best;
-}
-
-// ---------- XGBoost dynamic loader (web only) ----------
-declare global {
-  interface Window {
-    XGBoost?: any;
-  }
-}
-
-async function loadXGBoostWasm(): Promise<boolean> {
-  if (Platform.OS !== "web") return false;
-  if (window.XGBoost) return true;
-
-  // Load UMD bundle from a public CDN (no project dependency needed).
-  // If this fails at runtime, we will gracefully fallback to CART.
-  const scriptUrl = "https://unpkg.com/xgboost@1.7.6/dist/xgboost.min.js";
-  const wasmUrl   = "https://unpkg.com/xgboost@1.7.6/dist/xgboost.wasm";
-
-  // Inject <script>
-  await new Promise<void>((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = scriptUrl;
-    s.async = true;
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error("Failed to load xgboost.min.js"));
-    document.head.appendChild(s);
-  });
-
-  // Hint WASM location (library checks this global)
-  (window as any).XGBOOST_WASM_PATH = wasmUrl;
-
-  // Small wait to ensure WASM initialization
-  await new Promise(r => setTimeout(r, 100));
-  return typeof window.XGBoost !== "undefined";
 }
 
 // ---------- Simple color palette ----------
@@ -342,73 +308,16 @@ export default function HomeScreen() {
       return;
     }
 
-    // Try XGBoost (web)
-    let used: Model | null = null;
-
-    if (Platform.OS === "web") {
-      try {
-        const ok = await loadXGBoostWasm();
-        if (ok && window.XGBoost) {
-          // Simple XGBoost regression with default params
-          // Prepare DMatrix
-          const xgb = window.XGBoost;
-          const X = supervised.X;
-          const y = supervised.y;
-
-          const nrow = X.length;
-          const ncol = X[0].length;
-          const flat = new Float32Array(nrow * ncol);
-          for (let i = 0; i < nrow; i++) {
-            flat.set(X[i], i * ncol);
-          }
-          const dtrain = new xgb.DMatrix(flat, nrow, ncol, Float32Array);
-
-          const booster = new xgb.Booster({
-            "objective": "reg:squarederror",
-            "max_depth": 4,
-            "eta": 0.2,
-            "subsample": 0.8,
-            "min_child_weight": 1,
-            "lambda": 1.0,
-            "nthread": 0
-          });
-          await booster.update(dtrain, 50); // 50 boosting rounds
-
-          const xgbModel: Model = {
-            type: "xgboost",
-            fit: async () => { /* already trained */ },
-            predict: (Xtest: number[]) => {
-              const m = Xtest.length;
-              const flatT = new Float32Array(m * ncol);
-              for (let i = 0; i < m; i++) flatT.set(Xtest[i], i * ncol);
-              const dtest = new xgb.DMatrix(flatT, m, ncol, Float32Array);
-              const preds = booster.predict(dtest) as Float32Array;
-              return Array.from(preds);
-            }
-          };
-          used = xgbModel;
-          setStatus("Trained with XGBoost (WASM).");
-        }
-      } catch (e: any) {
-        // fallthrough to CART
-        console.warn(e);
-      }
-    }
-
-    // Fallback: CART
-    if (!used) {
-      const cart = new CARTRegressor(4, 5);
-      cart.fit(supervised.X, supervised.y);
-      const cartModel: Model = {
+    const cart = new CARTRegressor(4, 5);
+    cart.fit(supervised.X, supervised.y);
+    const cartModel: Model = {
         type: "cart",
         fit: () => {},
         predict: (Xtest: number[][]) => cart.predict(Xtest),
-      };
-      used = cartModel;
-      setStatus("Trained with CART (fallback).");
-    }
+    };
+    setStatus("Trained a CART model.");
 
-    setModel(used);
+    setModel(cartModel);
   }, [supervised]);
 
   // Predict button
@@ -427,7 +336,7 @@ export default function HomeScreen() {
   return (
     <View style={{ flex: 1, padding: 12, gap: 12 }}>
       <Text accessibilityRole="header" style={{ fontSize: 20, fontWeight: "600" }}>
-        Client-Side Time Series (CSV → Plot → XGBoost/CART → Predict)
+        Client-Side Time Series
       </Text>
 
       {/* File picker (web native <input>) */}
@@ -504,8 +413,7 @@ export default function HomeScreen() {
       {/* Tiny help */}
       <View style={{ paddingVertical: 8 }}>
         <Text style={{ fontSize: 12, color: "#555" }}>
-          Notes: On web, we try to load XGBoost WASM dynamically from a CDN. If it fails,
-          a compact CART regressor is used as a fallback. The supervised dataset uses all numeric
+          a compact CART regressor is used. The supervised dataset uses all numeric
           columns at time t and their lag-1 values to predict the target at time t (used for t→t+1 prediction).
         </Text>
       </View>
