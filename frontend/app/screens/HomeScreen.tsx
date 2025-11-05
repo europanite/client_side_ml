@@ -1,422 +1,685 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Platform, Text, View, Pressable, useWindowDimensions } from "react-native";
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import {
+  Platform,
+  Text,
+  View,
+  Pressable,
+  useWindowDimensions,
+  ScrollView,
+} from "react-native";
 
-/**
- * HomeScreen
- * - Import time-series CSV from a file picker
- * - Plot all series with distinct colors (web: HTMLCanvasElement; native
- * - Choose a target variable
- * - Train: try a tiny CART regressor.
- * - Predict: one-step-ahead prediction using last-available features (current row) to predict next target.
- *
- * No extra dependencies; works in Expo web export.
- */
+// --- Recharts (Web only) ---
+let Recharts: any = {};
+if (Platform.OS === "web") {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  Recharts = require("recharts");
+}
+const {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+} = Recharts;
+
+// --- XLSX (Web only) ---
+let XLSX: any = null;
+if (Platform.OS === "web") {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  XLSX = require("xlsx");
+}
 
 // ---------- Types ----------
-type Row = { [key: string]: number | Date | string | null };
+type Row = { [key: string]: number | string | Date | null };
 type DataFrame = {
-  columns: string[];           // includes 'datetime'
-  rows: Row[];                 // parsed rows
-  numericCols: string[];       // numeric columns only (exclude datetime)
+  columns: string[]; // includes 'datetime' if present
+  rows: Row[]; // parsed rows (objects with keys = columns)
+  numericCols: string[]; // numeric columns only (exclude 'datetime')
+  datetimeKey?: string; // detected datetime column name (if any)
 };
+
+type CartNode =
+  | {
+      kind: "leaf";
+      value: number;
+      size: number;
+      depth: number;
+    }
+  | {
+      kind: "split";
+      feature: number; // index in feature vector
+      threshold: number;
+      left: CartNode;
+      right: CartNode;
+      size: number;
+      depth: number;
+    };
 
 type Model = {
   type: "cart";
-  fit: (X: number[][], y: number[]) => Promise<void> | void;
-  predict: (X: number[][]) => number[]; // batch predict
+  nFeatures: number;
+  root: CartNode;
+  predictBatch: (X: number[][]) => number[];
 };
 
 // ---------- CSV Parsing ----------
 function parseCSV(text: string): DataFrame {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-  if (lines.length < 2) {
-    return { columns: [], rows: [], numericCols: [] };
-  }
-  const header = lines[0].split(",").map(s => s.trim());
-  const dtIdx = header.findIndex(h => h.toLowerCase() === "datetime");
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (lines.length < 2) return { columns: [], rows: [], numericCols: [] };
 
+  const header = lines[0].split(",").map((h) => h.trim());
   const rows: Row[] = [];
+
   for (let i = 1; i < lines.length; i++) {
-    const raw = lines[i].split(",");
-    if (raw.length !== header.length) {
-      // Skip malformed lines gracefully.
+    const parts = splitCsvLine(lines[i], header.length);
+    const row: Row = {};
+    header.forEach((h, idx) => {
+      row[h] = coerce(parts[idx]);
+    });
+    rows.push(row);
+  }
+
+  // detect datetime-like column
+  const datetimeKey = header.find(
+    (h) =>
+      h.toLowerCase() === "datetime" ||
+      h.toLowerCase() === "date" ||
+      h.toLowerCase() === "time"
+  );
+
+  const numericCols = header.filter((h) => {
+    if (datetimeKey && h === datetimeKey) return false;
+    // consider numeric if more than half of values are numbers
+    let nNum = 0;
+    for (const r of rows) if (typeof r[h] === "number") nNum++;
+    return nNum >= Math.max(1, Math.floor(rows.length * 0.5));
+  });
+
+  return { columns: header, rows, numericCols, datetimeKey };
+}
+
+function splitCsvLine(line: string, nCols: number): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"' && (i === 0 || line[i - 1] !== "\\")) {
+      inQuotes = !inQuotes;
       continue;
     }
-    const r: Row = {};
-    header.forEach((h, j) => {
-      if (j === dtIdx) {
-        const d = new Date(raw[j]);
-        r[h] = isNaN(+d) ? null : d;
-      } else {
-        const v = Number(raw[j]);
-        r[h] = isNaN(v) ? null : v;
-      }
-    });
-    rows.push(r);
-  }
-
-  // Detect numeric columns (drop non-numeric or mostly-null)
-  const numericCols = header.filter(h => h !== header[dtIdx]).filter(col => {
-    let ok = 0, total = 0;
-    for (const r of rows) {
-      if (typeof r[col] === "number") { ok++; }
-      total++;
+    if (c === "," && !inQuotes) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += c;
     }
-    return ok >= Math.max(2, Math.floor(total * 0.8)); // at least 80% numeric
+  }
+  out.push(cur);
+  while (out.length < nCols) out.push("");
+  return out;
+}
+
+function coerce(v: string | undefined): number | string | Date | null {
+  if (v == null) return null;
+  const t = v.trim();
+  if (t === "") return null;
+
+  // ISO-like date?
+  const maybeDate = new Date(t);
+  if (!isNaN(+maybeDate) && /[-T:\/]/.test(t)) return maybeDate;
+
+  const n = Number(t);
+  if (!isNaN(n)) return n;
+  return t;
+}
+
+// ---------- XLSX Parsing (SheetJS) ----------
+async function parseXLSX(file: File): Promise<DataFrame> {
+  if (!XLSX) throw new Error("XLSX not available on this platform");
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
+
+  // Choose first sheet
+  const first = wb.SheetNames[0];
+  const ws = wb.Sheets[first];
+
+  // to_json with header
+  const json: any[] = XLSX.utils.sheet_to_json(ws, { raw: true, defval: null });
+
+  if (!json.length) return { columns: [], rows: [], numericCols: [] };
+
+  // Columns from keys
+  const columns = Array.from(
+    new Set(json.flatMap((r) => Object.keys(r as object)))
+  );
+
+  // Normalize & coerce
+  const rows: Row[] = json.map((r) => {
+    const out: Row = {};
+    for (const c of columns) {
+      const v = (r as any)[c];
+      if (typeof v === "string") {
+        out[c] = coerce(v);
+      } else if (typeof v === "number") {
+        out[c] = v;
+      } else if (v && v instanceof Date) {
+        out[c] = v;
+      } else {
+        out[c] = v ?? null;
+      }
+    }
+    return out;
   });
 
-  return { columns: header, rows, numericCols };
+  // detect datetime
+  const datetimeKey = columns.find(
+    (h) =>
+      h.toLowerCase() === "datetime" ||
+      h.toLowerCase() === "date" ||
+      h.toLowerCase() === "time"
+  );
+
+  const numericCols = columns.filter((h) => {
+    if (datetimeKey && h === datetimeKey) return false;
+    let nNum = 0;
+    for (const r of rows) if (typeof r[h] === "number") nNum++;
+    return nNum >= Math.max(1, Math.floor(rows.length * 0.5));
+  });
+
+  return { columns, rows, numericCols, datetimeKey };
 }
 
-// ---------- Feature engineering (lag-1) ----------
-function buildSupervised(df: DataFrame, target: string) {
-  // Features: all numeric columns (including target) at t, plus lag-1 of all numeric columns.
-  // Label: target at t (next-step prediction uses row[t] features to predict y[t+1])
-  const dtCol = df.columns.find(c => c.toLowerCase() === "datetime") ?? "datetime";
-  const rows = df.rows
-    .filter(r => r[dtCol] instanceof Date)
-    .sort((a, b) => (a[dtCol] as Date).getTime() - (b[dtCol] as Date).getTime());
-
-  const X: number[][] = [];
-  const y: number[] = [];
-  const cols = df.numericCols;
-
-  for (let i = 1; i < rows.length; i++) {
-    const prev = rows[i - 1];
-    const cur = rows[i];
-
-    // Skip if any required numeric is null
-    const curNums = cols.map(c => (typeof cur[c] === "number" ? (cur[c] as number) : NaN));
-    const prevNums = cols.map(c => (typeof prev[c] === "number" ? (prev[c] as number) : NaN));
-    if (curNums.some(n => !isFinite(n)) || prevNums.some(n => !isFinite(n))) continue;
-
-    const feat = [...curNums, ...prevNums]; // [current features..., lag1 features...]
-    const label = cur[target] as number;
-    if (!isFinite(label)) continue;
-
-    X.push(feat);
-    y.push(label);
-  }
-
-  return { X, y, orderedRows: rows };
+// ---------- CART (tiny decision tree regressor) ----------
+function variance(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+  return arr.reduce((s, v) => s + (v - m) * (v - m), 0) / arr.length;
 }
 
-// ---------- Tiny CART Regressor ----------
-class CARTRegressor {
-  private root: any = null;
-  constructor(private maxDepth = 3, private minLeaf = 5) {}
-
-  fit(X: number[][], y: number[]) {
-    this.root = this.buildNode(X, y, 0);
+function buildCART(
+  X: number[][],
+  y: number[],
+  depth = 0,
+  maxDepth = 4,
+  minLeaf = 8
+): CartNode {
+  const n = y.length;
+  if (n <= minLeaf || depth >= maxDepth) {
+    const val = y.reduce((a, b) => a + b, 0) / Math.max(1, n);
+    return { kind: "leaf", value: val, size: n, depth };
   }
 
-  predict(X: number[][]): number[] {
-    return X.map(x => this.traverse(this.root, x));
-  }
+  const parentVar = variance(y);
+  let bestGain = 0;
+  let bestFeat = -1;
+  let bestThr = 0;
+  let bestLeftIdx: number[] = [];
+  let bestRightIdx: number[] = [];
 
-  private buildNode(X: number[][], y: number[], depth: number): any {
-    if (depth >= this.maxDepth || X.length <= this.minLeaf) {
-      return { leaf: true, value: mean(y) };
-    }
-    const { feat, thresh, leftIdx, rightIdx, gain } = bestSplit(X, y);
-    if (gain <= 0 || leftIdx.length === 0 || rightIdx.length === 0) {
-      return { leaf: true, value: mean(y) };
-    }
-    const XL = leftIdx.map(i => X[i]), yL = leftIdx.map(i => y[i]);
-    const XR = rightIdx.map(i => X[i]), yR = rightIdx.map(i => y[i]);
-    return {
-      leaf: false, feat, thresh,
-      left: this.buildNode(XL, yL, depth + 1),
-      right: this.buildNode(XR, yR, depth + 1),
-    };
-  }
-
-  private traverse(node: any, x: number): number;
-  private traverse(node: any, x: number[]): number;
-  private traverse(node: any, x: any): number {
-    if (node.leaf) return node.value;
-    const v = (x as number[])[node.feat];
-    if (v <= node.thresh) return this.traverse(node.left, x);
-    return this.traverse(node.right, x);
-  }
-}
-
-function variance(arr: number[]) {
-  const m = mean(arr);
-  return arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length;
-}
-function mean(arr: number[]) {
-  return arr.reduce((s, v) => s + v, 0) / Math.max(1, arr.length);
-}
-function bestSplit(X: number[][], y: number[]) {
   const nFeat = X[0]?.length ?? 0;
-  const baseVar = variance(y);
-  let best = { feat: 0, thresh: 0, leftIdx: [] as number[], rightIdx: [] as number[], gain: -Infinity };
 
   for (let f = 0; f < nFeat; f++) {
-    // choose candidate thresholds as midpoints of sorted unique values
-    const idx = X.map((row, i) => [row[f], i] as const).sort((a, b) => a[0] - b[0]);
-    for (let k = 1; k < idx.length; k++) {
-      if (idx[k][0] === idx[k - 1][0]) continue;
-      const thr = (idx[k][0] + idx[k - 1][0]) / 2;
-      const left: number[] = [], right: number[] = [];
-      for (const [, i] of idx) {
-        if (X[i][f] <= thr) left.push(i); else right.push(i);
+    // try candidate thresholds as quantiles (10 bins)
+    const vals = X.map((row) => row[f]).filter((v) => Number.isFinite(v));
+    if (!vals.length) continue;
+    const sorted = [...vals].sort((a, b) => a - b);
+    const candidates: number[] = [];
+    for (let q = 1; q < 10; q++) {
+      const idx = Math.floor((q * sorted.length) / 10);
+      if (idx >= 0 && idx < sorted.length) candidates.push(sorted[idx]);
+    }
+    for (const thr of candidates) {
+      const L: number[] = [];
+      const R: number[] = [];
+      const Li: number[] = [];
+      const Ri: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const v = X[i][f];
+        if (v <= thr) {
+          L.push(y[i]);
+          Li.push(i);
+        } else {
+          R.push(y[i]);
+          Ri.push(i);
+        }
       }
-      if (left.length === 0 || right.length === 0) continue;
-      const vL = variance(left.map(i => y[i]));
-      const vR = variance(right.map(i => y[i]));
-      const gain = baseVar - (vL * left.length + vR * right.length) / y.length;
-      if (gain > best.gain) {
-        best = { feat: f, thresh: thr, leftIdx: left, rightIdx: right, gain };
+      if (L.length < minLeaf || R.length < minLeaf) continue;
+      const gain =
+        parentVar -
+        (L.length / n) * variance(L) -
+        (R.length / n) * variance(R);
+      if (gain > bestGain) {
+        bestGain = gain;
+        bestFeat = f;
+        bestThr = thr;
+        bestLeftIdx = Li;
+        bestRightIdx = Ri;
       }
     }
   }
-  return best;
+
+  if (bestGain <= 1e-12 || bestFeat < 0) {
+    const val = y.reduce((a, b) => a + b, 0) / Math.max(1, n);
+    return { kind: "leaf", value: val, size: n, depth };
+  }
+
+  const XL = bestLeftIdx.map((i) => X[i]);
+  const XR = bestRightIdx.map((i) => X[i]);
+  const yL = bestLeftIdx.map((i) => y[i]);
+  const yR = bestRightIdx.map((i) => y[i]);
+
+  return {
+    kind: "split",
+    feature: bestFeat,
+    threshold: bestThr,
+    left: buildCART(XL, yL, depth + 1, maxDepth, minLeaf),
+    right: buildCART(XR, yR, depth + 1, maxDepth, minLeaf),
+    size: n,
+    depth,
+  };
 }
 
-// ---------- Simple color palette ----------
-const COLORS = [
-  "#1f77b4", "#ff7f0e", "#2ca02c",
-  "#d62728", "#9467bd", "#8c564b",
-  "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+function predictTree(node: CartNode, x: number[]): number {
+  if (node.kind === "leaf") return node.value;
+  return x[node.feature] <= node.threshold
+    ? predictTree(node.left, x)
+    : predictTree(node.right, x);
+}
+
+function fitCART(X: number[][], y: number[]): Model {
+  const root = buildCART(X, y);
+  return {
+    type: "cart",
+    nFeatures: X[0]?.length ?? 0,
+    root,
+    predictBatch: (XX: number[][]) => XX.map((r) => predictTree(root, r)),
+  };
+}
+
+// ---------- Color palette ----------
+const PALETTE = [
+  "#1f77b4",
+  "#ff7f0e",
+  "#2ca02c",
+  "#d62728",
+  "#9467bd",
+  "#8c564b",
+  "#e377c2",
+  "#7f7f7f",
+  "#bcbd22",
+  "#17becf",
+  "#393b79",
+  "#637939",
+  "#8c6d31",
+  "#843c39",
+  "#7b4173",
 ];
 
-// ---------- Canvas Line Chart (web only) ----------
-function drawChart(
-  canvas: HTMLCanvasElement,
-  df: DataFrame,
-  width: number,
-  height: number
-) {
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  canvas.width = width;
-  canvas.height = height;
-
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, width, height);
-
-  const dtCol = df.columns.find(c => c.toLowerCase() === "datetime") ?? "datetime";
-  const rows = df.rows
-    .filter(r => r[dtCol] instanceof Date)
-    .sort((a, b) => (a[dtCol] as Date).getTime() - (b[dtCol] as Date).getTime());
-
-  if (rows.length < 2 || df.numericCols.length === 0) {
-    ctx.fillStyle = "#333";
-    ctx.fillText("No chartable data", 10, 20);
-    return;
-  }
-
-  const left = 50, right = 10, top = 20, bottom = 30;
-  const W = width - left - right;
-  const H = height - top - bottom;
-
-  const minT = (rows[0][dtCol] as Date).getTime();
-  const maxT = (rows[rows.length - 1][dtCol] as Date).getTime();
-
-  // axis
-  ctx.strokeStyle = "#888";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(left, height - bottom);
-  ctx.lineTo(width - right, height - bottom);
-  ctx.moveTo(left, top);
-  ctx.lineTo(left, height - bottom);
-  ctx.stroke();
-
-  // For each series, compute min/max to share y-axis
-  let yMin = +Infinity, yMax = -Infinity;
-  for (const col of df.numericCols) {
-    for (const r of rows) {
-      const v = r[col] as number;
-      if (!isFinite(v)) continue;
-      yMin = Math.min(yMin, v);
-      yMax = Math.max(yMax, v);
-    }
-  }
-  if (!isFinite(yMin) || !isFinite(yMax) || yMin === yMax) {
-    yMin = yMin || 0; yMax = yMin + 1;
-  }
-
-  // Draw lines
-  df.numericCols.forEach((col, idx) => {
-    ctx.strokeStyle = COLORS[idx % COLORS.length];
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    let started = false;
-
-    rows.forEach(r => {
-      const t = (r[dtCol] as Date).getTime();
-      const v = r[col] as number;
-      if (!isFinite(v)) return;
-      const x = left + ((t - minT) / Math.max(1, (maxT - minT))) * W;
-      const y = top + (1 - (v - yMin) / Math.max(1e-9, (yMax - yMin))) * H;
-      if (!started) { ctx.moveTo(x, y); started = true; }
-      else { ctx.lineTo(x, y); }
-    });
-
-    ctx.stroke();
-
-    // Legend
-    ctx.fillStyle = ctx.strokeStyle;
-    ctx.fillRect(width - right - 120, top + 10 + idx * 16, 12, 12);
-    ctx.fillStyle = "#222";
-    ctx.fillText(col, width - right - 100, top + 20 + idx * 16);
-  });
+function colorFor(idx: number) {
+  return PALETTE[idx % PALETTE.length];
 }
 
-// ---------- Main Component ----------
+// ---------- HomeScreen ----------
 export default function HomeScreen() {
-  const { width } = useWindowDimensions();
-  const [df, setDf] = useState<DataFrame>({ columns: [], rows: [], numericCols: [] });
-  const [target, setTarget] = useState<string>("");
-  const [status, setStatus] = useState<string>("Ready.");
+  const { width, height } = useWindowDimensions();
+  const [df, setDf] = useState<DataFrame | null>(null);
+  const [visible, setVisible] = useState<Record<string, boolean>>({});
+  const [target, setTarget] = useState<string | null>(null);
   const [model, setModel] = useState<Model | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [prediction, setPrediction] = useState<number | null>(null);
+  const [status, setStatus] = useState<string>("");
 
-  // Render chart (web only)
-  useEffect(() => {
-    if (Platform.OS !== "web") return;
-    if (!canvasRef.current || df.rows.length === 0) return;
-    drawChart(canvasRef.current, df, Math.min(960, Math.max(360, width - 24)), 360);
-  }, [df, width]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const accept = ".csv, .xlsx, .xls";
 
-  // File import handler
-  const onFileChange = useCallback(async (file: File) => {
-    const text = await file.text();
-    const parsed = parseCSV(text);
-    setDf(parsed);
-    if (parsed.numericCols.length > 0) {
-      setTarget(parsed.numericCols[0]);
+  const onPickFile = useCallback(() => {
+    if (Platform.OS === "web") {
+      if (!fileInputRef.current) return;
+      fileInputRef.current.value = "";
+      fileInputRef.current.click();
     }
-    setStatus(`Loaded ${parsed.rows.length} rows. Numeric: ${parsed.numericCols.join(", ")}`);
   }, []);
 
-  // Build supervised dataset
-  const supervised = useMemo(() => {
-    if (!df.rows.length || !target) return null;
-    return buildSupervised(df, target);
+  const onFileChange = useCallback(async (e: any) => {
+    try {
+      const file: File | undefined = e.target?.files?.[0];
+      if (!file) return;
+      const name = (file.name || "").toLowerCase();
+
+      setStatus("Parsing...");
+      let parsed: DataFrame;
+
+      if (name.endsWith(".csv")) {
+        const text = await file.text();
+        parsed = parseCSV(text);
+      } else if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+        parsed = await parseXLSX(file);
+      } else {
+        setStatus("Unsupported file type. Please select CSV/XLSX.");
+        return;
+      }
+
+      // default visibility on
+      const vis: Record<string, boolean> = {};
+      for (let i = 0; i < parsed.numericCols.length; i++) {
+        vis[parsed.numericCols[i]] = true;
+      }
+
+      setDf(parsed);
+      setVisible(vis);
+      // auto-select first numeric column as target
+      setTarget(parsed.numericCols[0] ?? null);
+      setModel(null);
+      setPrediction(null);
+      setStatus("Loaded.");
+    } catch (err: any) {
+      setStatus(`Parse error: ${err?.message ?? String(err)}`);
+    }
+  }, []);
+
+  const toggleSeries = useCallback((key: string) => {
+    setVisible((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
+  const Xy = useMemo(() => {
+    if (!df || !target) return { X: [] as number[][], y: [] as number[], feat: [] as string[] };
+    const feat = df.numericCols.filter((c) => c !== target);
+    const X: number[][] = [];
+    const y: number[] = [];
+    for (const r of df.rows) {
+      const rowX = feat.map((f) => (typeof r[f] === "number" ? (r[f] as number) : NaN));
+      if (rowX.some((v) => !Number.isFinite(v))) continue;
+      const yy = r[target];
+      if (typeof yy !== "number" || !Number.isFinite(yy)) continue;
+      X.push(rowX);
+      y.push(yy);
+    }
+    return { X, y, feat };
   }, [df, target]);
 
-  // Train button
-  const onTrain = useCallback(async () => {
-    if (!supervised || supervised.X.length < 10) {
-      setStatus("Not enough data to train.");
+  const train = useCallback(() => {
+    if (!df || !target) {
+      setStatus("Load data and choose a target first.");
       return;
     }
+    const { X, y } = Xy;
+    if (X.length < 20) {
+      setStatus("Not enough rows to train (need >= 20 after cleaning).");
+      return;
+    }
+    const m = fitCART(X, y);
+    setModel(m);
+    setPrediction(null);
+    setStatus(`Trained CART with ${m.nFeatures} features on ${X.length} rows.`);
+  }, [df, target, Xy]);
 
-    const cart = new CARTRegressor(4, 5);
-    cart.fit(supervised.X, supervised.y);
-    const cartModel: Model = {
-        type: "cart",
-        fit: () => {},
-        predict: (Xtest: number[][]) => cart.predict(Xtest),
-    };
-    setStatus("Trained a CART model.");
-
-    setModel(cartModel);
-  }, [supervised]);
-
-  // Predict button
-  const onPredict = useCallback(() => {
-    if (!supervised || !model) {
+  const predict = useCallback(() => {
+    if (!df || !target || !model) {
       setStatus("Train a model first.");
       return;
     }
-    // Use the last available feature row to predict the next target (one-step ahead).
-    const lastX = supervised.X.at(-1)!; // current features
-    const pred = model.predict([lastX])[0];
-    setStatus(`Next ${target} (t+1) predicted: ${pred.toFixed(3)} [${model.type}]`);
-  }, [model, supervised, target]);
+    const feat = df.numericCols.filter((c) => c !== target);
+    if (!feat.length) {
+      setStatus("No features to predict from.");
+      return;
+    }
+    const last = df.rows[df.rows.length - 1];
+    const x = feat.map((f) => (typeof last[f] === "number" ? (last[f] as number) : NaN));
+    if (x.some((v) => !Number.isFinite(v))) {
+      setStatus("Last row has missing feature values.");
+      return;
+    }
+    const yhat = model.predictBatch([x])[0];
+    setPrediction(yhat);
+    setStatus("Predicted next 1 step (using last row features).");
+  }, [df, target, model]);
 
-  // ---------- UI ----------
+  // ----- Chart Data -----
+  const chartData = useMemo(() => {
+    if (!df) return [];
+    // Create plotting rows: X-axis will be index or datetime label
+    return df.rows.map((r, idx) => {
+      const o: any = { _i: idx };
+      if (df.datetimeKey && r[df.datetimeKey]) {
+        const v = r[df.datetimeKey];
+        o._x =
+          v instanceof Date
+            ? v.toISOString()
+            : typeof v === "string"
+            ? v
+            : String(v);
+      } else {
+        o._x = String(idx + 1);
+      }
+      for (const c of df.numericCols) {
+        o[c] = typeof r[c] === "number" ? (r[c] as number) : null;
+      }
+      return o;
+    });
+  }, [df]);
+
+  const series = df?.numericCols ?? [];
+
+  // ----- Styling helpers -----
+  const CONTENT_MAX_W = 980;
+  const CHART_H = Math.min(Math.max(360, Math.floor(height * 0.45)), 560);
+
+  const renderWebInputs = () =>
+    Platform.OS === "web" ? (
+      <input
+        ref={fileInputRef as any}
+        type="file"
+        accept={accept}
+        onChange={onFileChange}
+        style={{ display: "none" }}
+      />
+    ) : null;
+
   return (
-    <View style={{ flex: 1, padding: 12, gap: 12 }}>
-      <Text accessibilityRole="header" style={{ fontSize: 20, fontWeight: "600" }}>
-        Client-Side Time Series
-      </Text>
+    <View
+      style={{
+        flex: 1,
+        backgroundColor: "#0b0c10",
+      }}
+    >
+      {renderWebInputs()}
+      <ScrollView contentContainerStyle={{ alignItems: "center", paddingBottom: 48 }}>
+        <View style={{ width: "100%", maxWidth: CONTENT_MAX_W, padding: 16, gap: 16 }}>
+          {/* Header */}
+          <View style={{ gap: 8 }}>
+            <Text style={{ color: "#fff", fontSize: 22, fontWeight: "700" }}>
+              Client-side ML — Time-series Playground
+            </Text>
+            <Text style={{ color: "#9aa0a6" }}>
+              Import CSV/XLSX, view all series, choose a target, train a tiny CART, and predict one
+              step ahead.
+            </Text>
+          </View>
 
-      {/* File picker (web native <input>) */}
-      <View style={{ gap: 6 }}>
-        <Text style={{ fontWeight: "600" }}>1) Import CSV (must include a 'datetime' column):</Text>
-        {Platform.OS === "web" ? (
-          <input
-            type="file"
-            accept=".csv,text/csv"
-            onChange={(e) => {
-              const f = (e.target as HTMLInputElement).files?.[0];
-              if (f) onFileChange(f);
+          {/* Action row */}
+          <View
+            style={{
+              flexDirection: "row",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: 8,
             }}
-          />
-        ) : (
-          <Text>File picker is available on web build. On native, please supply data via web.</Text>
-        )}
-      </View>
-
-      {/* Target selection */}
-      <View style={{ gap: 6 }}>
-        <Text style={{ fontWeight: "600" }}>2) Choose target variable:</Text>
-        {df.numericCols.length === 0 ? (
-          <Text>- (Load CSV first)</Text>
-        ) : (
-          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-            {df.numericCols.map((c) => (
-              <Pressable
-                key={c}
-                onPress={() => setTarget(c)}
+          >
+            <ActionButton label="Import CSV/XLSX" onPress={onPickFile} bg="#1a73e8" />
+            <ActionButton label="Train (Decision Tree)" onPress={train} bg="#34a853" />
+            <ActionButton label="Predict +1" onPress={predict} bg="#f9ab00" fg="#000" />
+            {prediction != null && (
+              <View
                 style={{
-                  paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8,
-                  backgroundColor: c === target ? "#222" : "#eee"
+                  paddingHorizontal: 10,
+                  paddingVertical: 8,
+                  borderRadius: 10,
+                  backgroundColor: "#202124",
                 }}
               >
-                <Text style={{ color: c === target ? "#fff" : "#222" }}>{c}</Text>
-              </Pressable>
-            ))}
+                <Text style={{ color: "#fff" }}>
+                  Prediction ({target ?? "?"}):{" "}
+                  <Text style={{ color: "#f9ab00", fontWeight: "700" }}>
+                    {Number.isFinite(prediction) ? prediction.toFixed(4) : String(prediction)}
+                  </Text>
+                </Text>
+              </View>
+            )}
           </View>
-        )}
-      </View>
 
-      {/* Chart area */}
-      <View style={{ gap: 6 }}>
-        <Text style={{ fontWeight: "600" }}>3) Plot (all series, color-coded):</Text>
-        {Platform.OS === "web" ? (
-          <canvas ref={canvasRef} style={{ width: "100%", maxWidth: 960, height: 360, borderWidth: 1, borderColor: "#ddd" }} />
-        ) : (
-          <Text>Chart rendering is available on web. (This screen uses an HTML5 canvas on web.)</Text>
-        )}
-      </View>
+          {/* Target chooser */}
+          <View style={{ gap: 8 }}>
+            <Text style={{ color: "#9aa0a6" }}>Target variable</Text>
+            <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+              {series.map((s, idx) => (
+                <Pressable
+                  key={s}
+                  onPress={() => setTarget(s)}
+                  style={{
+                    paddingHorizontal: 12,
+                    paddingVertical: 8,
+                    borderRadius: 999,
+                    borderWidth: 2,
+                    borderColor: colorFor(idx),
+                    backgroundColor: target === s ? colorFor(idx) : "transparent",
+                  }}
+                >
+                  <Text
+                    style={{
+                      color: target === s ? "#000" : colorFor(idx),
+                      fontWeight: "700",
+                    }}
+                  >
+                    {s}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
 
-      {/* Train & Predict */}
-      <View style={{ gap: 10, flexDirection: "row", flexWrap: "wrap" }}>
-        <Pressable
-          onPress={onTrain}
-          style={{ backgroundColor: "#047857", paddingHorizontal: 14, paddingVertical: 10, borderRadius: 8 }}
-        >
-          <Text style={{ color: "#fff", fontWeight: "600" }}>Train</Text>
-        </Pressable>
-        <Pressable
-          onPress={onPredict}
-          style={{ backgroundColor: "#1d4ed8", paddingHorizontal: 14, paddingVertical: 10, borderRadius: 8 }}
-        >
-          <Text style={{ color: "#fff", fontWeight: "600" }}>Predict (t+1)</Text>
-        </Pressable>
-      </View>
+          {/* Series toggles (color-coded) */}
+          <View style={{ gap: 8 }}>
+            <Text style={{ color: "#9aa0a6" }}>Series visibility</Text>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+              {series.map((s, idx) => {
+                const on = visible[s] ?? true;
+                const c = colorFor(idx);
+                return (
+                  <Pressable
+                    key={s}
+                    onPress={() => toggleSeries(s)}
+                    style={{
+                      paddingHorizontal: 12,
+                      paddingVertical: 8,
+                      borderRadius: 8,
+                      backgroundColor: on ? c : "transparent",
+                      borderWidth: 2,
+                      borderColor: c,
+                    }}
+                  >
+                    <Text style={{ color: on ? "#000" : c, fontWeight: "700" }}>{s}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
 
-      {/* Status */}
-      <View style={{ paddingVertical: 8 }}>
-        <Text style={{ fontFamily: "monospace" }}>{status}</Text>
-      </View>
+          {/* Chart */}
+          <View
+            style={{
+              width: "100%",
+              height: CHART_H,
+              backgroundColor: "#111316",
+              borderRadius: 16,
+              padding: 12,
+            }}
+          >
+            {Platform.OS === "web" ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+                  <CartesianGrid stroke="#2b2f36" strokeDasharray="3 3" />
+                  <XAxis dataKey="_x" stroke="#9aa0a6" />
+                  <YAxis stroke="#9aa0a6" />
+                  <Tooltip />
+                  <Legend />
+                  {series.map((s, idx) =>
+                    visible[s] ? (
+                      <Line
+                        key={s}
+                        type="monotone"
+                        dataKey={s}
+                        stroke={colorFor(idx)}
+                        dot={false}
+                        strokeWidth={2}
+                        isAnimationActive={false}
+                      />
+                    ) : null
+                  )}
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
+                <Text style={{ color: "#9aa0a6", textAlign: "center", padding: 16 }}>
+                  Charts are available on the Web build. Please open this app in a browser.
+                </Text>
+              </View>
+            )}
+          </View>
 
-      {/* Tiny help */}
-      <View style={{ paddingVertical: 8 }}>
-        <Text style={{ fontSize: 12, color: "#555" }}>
-          a compact CART regressor is used. The supervised dataset uses all numeric
-          columns at time t and their lag-1 values to predict the target at time t (used for t→t+1 prediction).
-        </Text>
-      </View>
+          {/* Status */}
+          {status ? (
+            <View style={{ paddingHorizontal: 12, paddingVertical: 10, backgroundColor: "#202124", borderRadius: 10 }}>
+              <Text style={{ color: "#9aa0a6" }}>{status}</Text>
+            </View>
+          ) : null}
+        </View>
+      </ScrollView>
+
+      {/* Hidden <input> only on web */}
+      {Platform.OS === "web" ? (
+        <input
+          ref={fileInputRef as any}
+          type="file"
+          accept={accept}
+          onChange={onFileChange}
+          style={{ display: "none" }}
+        />
+      ) : null}
     </View>
+  );
+}
+
+// ---------- Small UI component ----------
+function ActionButton({
+  label,
+  onPress,
+  bg,
+  fg = "#fff",
+}: {
+  label: string;
+  onPress: () => void;
+  bg: string;
+  fg?: string;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({
+        backgroundColor: bg,
+        paddingHorizontal: 14,
+        paddingVertical: 10,
+        borderRadius: 10,
+        opacity: pressed ? 0.8 : 1,
+      })}
+    >
+      <Text style={{ color: fg, fontWeight: "700" }}>{label}</Text>
+    </Pressable>
   );
 }
