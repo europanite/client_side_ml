@@ -1,6 +1,6 @@
-title: "frontend_template"
+title: "client_side_ml"
 description: "A Template For Frontend Development."
-baseurl: "/frontend_template"
+baseurl: "/client_side_ml"
 url: "https://europanite.github.io"
 theme: minima
 markdown: kramdown
