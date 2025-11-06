@@ -8,7 +8,19 @@ A Client-Side Machine Learning Playground.
 
  [Client-Side Machine Learning ](https://europanite.github.io/client_side_ml/)
 
-Import **CSV/XLSX** in the browser, visualize **all series**, pick a **target**, train a tiny **decision-tree (CART) regressor**, then **predict the next 1 point** — all client-side with Expo + Metro (web), Recharts, and SheetJS.
+Import **CSV/XLSX** in the browser, visualize **all series**, pick a **target**, train a **decision-tree (CART) regressor**, then **predict the next 1 point** 
+
+---
+
+## Data Structure
+
+<pre>
+datetime,item_a,item_b,item_c,...
+2025-01-01 00:00:00+09:00,10,20,31,...
+2025-01-02 00:00:00+09:00,12,19,31,...
+2025-01-03 00:00:00+09:00,14,18,33,...
+ ...
+</pre>
 
 ---
 
@@ -35,18 +47,6 @@ Import **CSV/XLSX** in the browser, visualize **all series**, pick a **target**,
 - Greedy binary splits on quantile candidates
 - Defaults: `maxDepth=4`, `minLeaf=8`
 - Train button builds the tree on filtered numeric rows; **Predict +1** uses the **last row’s feature vector** to estimate the next target value.
-
-
----
-
-### Acknowledgements
-
-- **Expo + Metro** for the web app build
-- **Recharts** for fast SVG charts
-- **SheetJS** for in-browser Excel parsing
-
-
-## 🧰 How It Works
 
 ---
 
