@@ -1,10 +1,10 @@
-# [Client Side XGBoost](https://github.com/europanite/client_side_xgboost "Client Side XGBoost")
+# [Client Side ML](https://github.com/europanite/client_side_ml "Client Side ML")
 
 !["web_ui"](./assets/images/web_ui.png)
 
- [PlayGround](https://europanite.github.io/client_side_xgboost/)
+ [PlayGround](https://europanite.github.io/client_side_ml/)
 
-Client Side Browser-Based XGBoost Time-Series Prediction. 
+Client Side Browser-Based CART Time-Series Prediction. 
 
 ---
 
@@ -17,12 +17,6 @@ datetime,item_a,item_b,item_c,...
 2025-01-03 00:00:00+09:00,14,18,33,...
  ...
 </pre>
-
----
-
-**Development Environment**
-- **Vite**: [Vite](https://vite.dev/) 
-- **Container**: [Docker Compose](https://docs.docker.com/compose/) for consistent development setup
 
 ---
 
@@ -42,4 +36,15 @@ docker compose build
 docker compose up
 ```
 
+### 3. Test:
+```bash
+docker compose \
+-f docker-compose.test.yml up \
+--build --exit-code-from \
+frontend_test
+```
+
 ---
+
+# License
+- Apache License 2.0
