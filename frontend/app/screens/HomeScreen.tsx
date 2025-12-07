@@ -594,7 +594,7 @@ export default function HomeScreen() {
               </Text>
             </Pressable>
             <Text style={{ color: "#9aa0a6" }}>
-              A browser-based multivariate time series forecasting tool. No installation, registration, or payment required.
+              A browser-based multivariate time series forecasting tool powered by CART. No installation, registration, or payment required.
             </Text>
           </View>
           {/* Action row */}
