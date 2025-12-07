@@ -577,15 +577,26 @@ export default function HomeScreen() {
         <View style={{ width: "100%", maxWidth: CONTENT_MAX_W, padding: 16, gap: 16 }}>
           {/* Header */}
           <View style={{ gap: 8 }}>
-            <Text style={{ color: "#fff", fontSize: 22, fontWeight: "700" }}>
-              Client Side Machine Learning
-            </Text>
+            <Pressable
+              onPress={() =>
+                Linking.openURL("https://github.com/europanite/client_side_ml")
+              }
+            >
+              <Text
+                style={{
+                  color: "#fff",
+                  fontSize: 22,
+                  fontWeight: "700",
+                  textDecorationLine: "underline",
+                }}
+              >
+                Client Side Machine Learning
+              </Text>
+            </Pressable>
             <Text style={{ color: "#9aa0a6" }}>
-              Import CSV/XLSX, view all series, choose a target, train a tiny CART, and predict one
-              step ahead.
+              A browser-based multivariate time series forecasting tool. No installation, registration, or payment required.
             </Text>
           </View>
-
           {/* Action row */}
           <View
             style={{

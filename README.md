@@ -30,6 +30,8 @@ datetime,item_a,item_b,item_c,...
 ### 2. Build and start all services:
 
 ```bash
+# set environment variables:
+export REACT_NATIVE_PACKAGER_HOSTNAME=${YOUR_HOST}
 
 # Build the image
 docker compose build
