@@ -6,6 +6,8 @@ import {
   Pressable,
   useWindowDimensions,
   ScrollView,
+  Linking,
+  TouchableOpacity,
 } from "react-native";
 
 
@@ -565,6 +567,8 @@ export default function HomeScreen() {
       />
     ) : null;
 
+  const REPO_URL = "https://github.com/europanite/client_side_ml";
+
   return (
     <View
       style={{
@@ -577,11 +581,7 @@ export default function HomeScreen() {
         <View style={{ width: "100%", maxWidth: CONTENT_MAX_W, padding: 16, gap: 16 }}>
           {/* Header */}
           <View style={{ gap: 8 }}>
-            <Pressable
-              onPress={() =>
-                Linking.openURL("https://github.com/europanite/client_side_ml")
-              }
-            >
+            <TouchableOpacity onPress={() => Linking.openURL(REPO_URL)}>
               <Text
                 style={{
                   color: "#fff",
@@ -592,7 +592,7 @@ export default function HomeScreen() {
               >
                 Client Side Machine Learning
               </Text>
-            </Pressable>
+            </TouchableOpacity>
             <Text style={{ color: "#9aa0a6" }}>
               A browser-based multivariate time series forecasting tool powered by CART. No installation, registration, or payment required.
             </Text>
